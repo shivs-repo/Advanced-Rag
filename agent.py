@@ -27,7 +27,11 @@ PINECONE_API_KEY   = os.environ["PINECONE_API_KEY"]
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 INDEX_NAME         = os.getenv("PINECONE_INDEX", "hr-rag")
 NAMESPACE          = "candidates"
+POLICY_INDEX       = os.getenv("PINECONE_POLICY_INDEX", "policy-rag")
+POLICY_NAMESPACE   = "policies"
 LLM_MODEL          = "openai/gpt-4o-mini"
+LLM_for_supervisor="openai/gpt-4o-mini"
+LLM_for_JD="nvidia/nemotron-3.5-lightning:free"
 EMBED_MODEL        = "openai/text-embedding-3-small"
 BM25_PATH          = "bm25_index.pkl"
 DENSE_TOP_K        = 20   # candidates fetched from Pinecone
@@ -56,6 +60,8 @@ class AgentState(TypedDict):
     next:            str
     rag_result:      str
     jd_result:       str
+    policy_result:   str
+    policy_sources:  list[dict]
     final_answer:    str
     _rag_query:      str
     _jd_description: str
@@ -76,6 +82,23 @@ SUPERVISOR_TOOLS = [
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Search query for candidate retrieval"}
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "route_to_policy",
+            "description": (
+                "Route to the Policy RAG node to answer company policy questions. "
+                "Use when the user asks about HR policies, leave, benefits, code of conduct, or any corporate policy."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Policy-related question"}
                 },
                 "required": ["query"],
             },
@@ -161,14 +184,17 @@ def supervisor(state: AgentState) -> AgentState:
         context += f"\n\nRAG search result:\n{state['rag_result']}"
     if state.get("jd_result"):
         context += f"\n\nJD generation result:\n{state['jd_result']}"
+    if state.get("policy_result"):
+        context += f"\n\nPolicy RAG result:\n{state['policy_result']}"
 
     messages = [
         {
             "role": "system",
             "content": (
-                "You are an HR supervisor agent coordinating two specialist nodes:\n"
+                "You are an HR supervisor agent coordinating three specialist nodes:\n"
                 "- route_to_rag: searches the candidate database (hybrid RAG + re-ranking)\n"
-                "- route_to_jd: generates a Job Description from a short description\n\n"
+                "- route_to_jd: generates a Job Description from a short description\n"
+                "- route_to_policy: answers company policy questions (leave, benefits, conduct, HR policies)\n\n"
                 "Call the appropriate tool if a task is still pending. "
                 "If all required tasks are complete, respond directly with the final "
                 "synthesized answer WITHOUT calling any tool."
@@ -199,6 +225,8 @@ def supervisor(state: AgentState) -> AgentState:
                 "next":            "rag",
                 "rag_result":      "",
                 "jd_result":       state.get("jd_result", ""),
+                "policy_result":   state.get("policy_result", ""),
+                "policy_sources":  state.get("policy_sources", []),
                 "final_answer":    "",
                 "_rag_query":      args["query"],
                 "_jd_description": state.get("_jd_description", ""),
@@ -211,9 +239,25 @@ def supervisor(state: AgentState) -> AgentState:
                 "next":            "jd",
                 "rag_result":      state.get("rag_result", ""),
                 "jd_result":       "",
+                "policy_result":   state.get("policy_result", ""),
+                "policy_sources":  state.get("policy_sources", []),
                 "final_answer":    "",
                 "_rag_query":      state.get("_rag_query", ""),
                 "_jd_description": args["role_description"],
+            }
+
+        if name == "route_to_policy":
+            print(f"  [supervisor] → policy_rag_node | query: \"{args['query']}\"")
+            return {
+                "messages":        [],
+                "next":            "policy",
+                "rag_result":      state.get("rag_result", ""),
+                "jd_result":       state.get("jd_result", ""),
+                "policy_result":   "",
+                "policy_sources":  [],
+                "final_answer":    "",
+                "_rag_query":      state.get("_rag_query", ""),
+                "_jd_description": state.get("_jd_description", ""),
             }
 
     print(f"  [supervisor] → all tasks done, synthesizing final answer")
@@ -222,6 +266,8 @@ def supervisor(state: AgentState) -> AgentState:
         "next":            "end",
         "rag_result":      state.get("rag_result", ""),
         "jd_result":       state.get("jd_result", ""),
+        "policy_result":   state.get("policy_result", ""),
+        "policy_sources":  state.get("policy_sources", []),
         "final_answer":    msg.content or "",
         "_rag_query":      state.get("_rag_query", ""),
         "_jd_description": state.get("_jd_description", ""),
@@ -262,6 +308,8 @@ def rag_node(state: AgentState) -> AgentState:
         "next":            "supervisor",
         "rag_result":      "\n---\n".join(top_docs),
         "jd_result":       state.get("jd_result", ""),
+        "policy_result":   state.get("policy_result", ""),
+        "policy_sources":  state.get("policy_sources", []),
         "final_answer":    "",
         "_rag_query":      query,
         "_jd_description": state.get("_jd_description", ""),
@@ -275,7 +323,7 @@ def jd_node(state: AgentState) -> AgentState:
     print(f"\n[jd_node] Generating JD for: \"{role_description}\"")
 
     resp = openai_client.chat.completions.create(
-        model=LLM_MODEL,
+        model=LLM_for_JD,
         messages=[{
             "role": "user",
             "content": (
@@ -293,25 +341,74 @@ def jd_node(state: AgentState) -> AgentState:
         }],
     )
     jd = resp.choices[0].message.content
-    print(f"  [jd_node] JD generated ({len(jd)} chars)")
+    print(f" [jd_node] using {LLM_for_JD} JD generated ({len(jd)} chars)")
+
 
     return {
         "messages":        [],
         "next":            "supervisor",
         "rag_result":      state.get("rag_result", ""),
         "jd_result":       jd,
+        "policy_result":   state.get("policy_result", ""),
+        "policy_sources":  state.get("policy_sources", []),
         "final_answer":    "",
         "_rag_query":      state.get("_rag_query", ""),
         "_jd_description": role_description,
     }
 
 # ============================================================
+# Node 4 — POLICY RAG NODE  (Dense search against policy-rag index)
+# ============================================================
+def policy_rag_node(state: AgentState) -> AgentState:
+    query = state["messages"][0]["content"]
+    print(f"\n[policy_rag_node] Policy search | query: \"{query}\"")
+
+    vec   = embed_query(query)
+    index = pc.Index(POLICY_INDEX)
+    results = index.query(vector=vec, top_k=5, namespace=POLICY_NAMESPACE, include_metadata=True)
+    docs  = [m["metadata"]["text"] for m in results["matches"]]
+    sources = [
+        {
+            "id": m["id"],
+            "source": m["metadata"].get("source", "policy"),
+            "page": m["metadata"].get("page", ""),
+            "images": m["metadata"].get("images", ""),
+        }
+        for m in results["matches"]
+    ]
+    print(f"  [policy_rag_node] Retrieved {len(docs)} policy chunks")
+
+    context = "\n---\n".join(docs)
+    resp = openai_client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[
+            {"role": "system", "content": "You are an HR policy expert. Answer the question using only the provided policy excerpts."},
+            {"role": "user",   "content": f"Policy excerpts:\n{context}\n\nQuestion: {query}"},
+        ],
+    )
+    answer = resp.choices[0].message.content
+    print(f"  [policy_rag_node] Answer generated ({len(answer)} chars)")
+
+    return {
+        "messages":        [],
+        "next":            "supervisor",
+        "rag_result":      state.get("rag_result", ""),
+        "jd_result":       state.get("jd_result", ""),
+        "policy_result":   answer,
+        "policy_sources":  sources,
+        "final_answer":    "",
+        "_rag_query":      state.get("_rag_query", ""),
+        "_jd_description": state.get("_jd_description", ""),
+    }
+
+# ============================================================
 # Conditional edge
 # ============================================================
-def supervisor_router(state: AgentState) -> Literal["rag_node", "jd_node", "__end__"]:
+def supervisor_router(state: AgentState) -> Literal["rag_node", "jd_node", "policy_rag_node", "__end__"]:
     route = state.get("next", "end")
-    if route == "rag":  return "rag_node"
-    if route == "jd":   return "jd_node"
+    if route == "rag":    return "rag_node"
+    if route == "jd":     return "jd_node"
+    if route == "policy": return "policy_rag_node"
     return "__end__"
 
 # ============================================================
@@ -319,16 +416,18 @@ def supervisor_router(state: AgentState) -> Literal["rag_node", "jd_node", "__en
 # ============================================================
 def build_graph():
     g = StateGraph(AgentState)
-    g.add_node("supervisor", supervisor)
-    g.add_node("rag_node",   rag_node)
-    g.add_node("jd_node",    jd_node)
+    g.add_node("supervisor",     supervisor)
+    g.add_node("rag_node",       rag_node)
+    g.add_node("jd_node",        jd_node)
+    g.add_node("policy_rag_node", policy_rag_node)
     g.set_entry_point("supervisor")
     g.add_conditional_edges(
         "supervisor", supervisor_router,
-        {"rag_node": "rag_node", "jd_node": "jd_node", "__end__": END},
+        {"rag_node": "rag_node", "jd_node": "jd_node", "policy_rag_node": "policy_rag_node", "__end__": END},
     )
-    g.add_edge("rag_node", "supervisor")
-    g.add_edge("jd_node",  "supervisor")
+    g.add_edge("rag_node",        "supervisor")
+    g.add_edge("jd_node",         "supervisor")
+    g.add_edge("policy_rag_node", "supervisor")
     return g.compile()
 
 # ============================================================
@@ -341,6 +440,7 @@ def run(user_query: str) -> str:
         "next":            "",
         "rag_result":      "",
         "jd_result":       "",
+        "policy_result":   "",
         "final_answer":    "",
         "_rag_query":      "",
         "_jd_description": "",
@@ -349,6 +449,7 @@ def run(user_query: str) -> str:
     return result["final_answer"]
 
 if __name__ == "__main__":
-    run("Find me senior ML engineers with LangChain and RAG experience")
+    run("Quarterly expense trend in Q1 for corporate travel expense?")
+    run("if my working model is hybrid, how many times i have to visit the onsite?")
     # run("Write a JD for a Senior DevOps Engineer with Kubernetes and AWS at a fintech startup")
     # run("I need to hire a computer vision engineer — find matching candidates and write a JD")
